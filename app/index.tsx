@@ -199,7 +199,10 @@ export default function TransposeScreen() {
   }, []);
 
   const buildStreamUrl = useCallback((semi: number, seek = 0) => {
-    const params = new URLSearchParams({ semitones: semi.toString(), url: currentYTUrlRef.current || "" });
+    const directUrl = directAudioUrlRef.current;
+    const params = new URLSearchParams({ semitones: semi.toString() });
+    if (directUrl) params.set("directUrl", directUrl);
+    else params.set("url", currentYTUrlRef.current || "");
     if (seek > 0.5) params.set("seek", seek.toFixed(2));
     return `${API_BASE}/audio/stream?${params}`;
   }, []);
@@ -246,8 +249,9 @@ export default function TransposeScreen() {
       // the server has the yt-dlp URL cached and will serve it instantly.
       if (!reuseUrl || !isSameVideo) {
         currentYTUrlRef.current = u;
+        directAudioUrlRef.current = null;
 
-        // Try WebView first to get title/duration quickly
+        // WebView runs on the phone's own IP — no bot detection, instant CDN URL
         let webViewResult: { audioUrl: string; title: string; duration: number } | null = null;
         try {
           webViewResult = await fetchAudioUrlViaWebView(u);
@@ -256,8 +260,14 @@ export default function TransposeScreen() {
         }
 
         if (webViewResult) {
+          directAudioUrlRef.current = webViewResult.audioUrl;
           setInfo({ title: webViewResult.title || "" });
           if (webViewResult.duration > 0) setDuration(webViewResult.duration);
+          // Key detection using the CDN URL directly — no yt-dlp needed on server
+          fetch(`${API_BASE}/audio/key?${new URLSearchParams({ directUrl: webViewResult.audioUrl })}`)
+            .then(r => r.ok ? r.json() : null)
+            .then(data => { if (data?.key) setDetectedKey({ key: data.key, mode: data.mode }); })
+            .catch(() => {});
         } else {
           setInfo({ title: "" });
           fetch(`${API_BASE}/audio/info?${new URLSearchParams({ url: u })}`)
@@ -267,16 +277,23 @@ export default function TransposeScreen() {
               if (data?.duration > 0) setDuration(data.duration);
             })
             .catch(() => {});
+          fetch(`${API_BASE}/audio/key?${new URLSearchParams({ url: u })}`)
+            .then(r => r.ok ? r.json() : null)
+            .then(data => { if (data?.key) setDetectedKey({ key: data.key, mode: data.mode }); })
+            .catch(() => {});
         }
-        // Always detect key via server yt-dlp (server-side URL is not IP-restricted)
-        fetch(`${API_BASE}/audio/key?${new URLSearchParams({ url: u })}`)
-          .then(r => r.ok ? r.json() : null)
-          .then(data => { if (data?.key) setDetectedKey({ key: data.key, mode: data.mode }); })
-          .catch(() => {});
       }
 
+      // For 0-semitone playback with a WebView-extracted CDN URL:
+      // stream directly from YouTube CDN on the phone's own IP — no server at all.
+      // For pitch-shifted audio: always go through the server (ffmpeg processes the CDN URL).
+      const directUrl = directAudioUrlRef.current;
+      const playUri = (directUrl && Math.abs(semi) < 0.01 && !startPosition)
+        ? directUrl
+        : buildStreamUrl(semi, startPosition);
+
       const { sound } = await Audio.Sound.createAsync(
-        { uri: buildStreamUrl(semi, startPosition) },
+        { uri: playUri },
         { shouldPlay: true, progressUpdateIntervalMillis: 1000 },
         (s: AVPlaybackStatus) => {
           if (!s.isLoaded) return;
