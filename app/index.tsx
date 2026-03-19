@@ -198,10 +198,8 @@ export default function TransposeScreen() {
     }
   }, []);
 
-  const buildStreamUrl = useCallback((directUrl: string | null, semi: number, seek = 0) => {
-    const params = new URLSearchParams({ semitones: semi.toString() });
-    if (directUrl) params.set("directUrl", directUrl);
-    else params.set("url", currentYTUrlRef.current || "");
+  const buildStreamUrl = useCallback((semi: number, seek = 0) => {
+    const params = new URLSearchParams({ semitones: semi.toString(), url: currentYTUrlRef.current || "" });
     if (seek > 0.5) params.set("seek", seek.toFixed(2));
     return `${API_BASE}/audio/stream?${params}`;
   }, []);
@@ -241,42 +239,27 @@ export default function TransposeScreen() {
     setDetectedKey(null);
 
     try {
-      let directAudioUrl = directAudioUrlRef.current;
       const isSameVideo = currentYTUrlRef.current === u;
 
-      // Only re-extract the audio URL when loading a brand-new song.
-      // For pitch/speed changes (reuseUrl=true, same video), skip WebView/yt-dlp entirely —
-      // directAudioUrl may be null here (server-fallback path) and that's fine; the server
-      // has the URL cached and will serve it instantly without running yt-dlp again.
+      // Only re-extract title/key when loading a brand-new song.
+      // For pitch changes (reuseUrl=true, same video), skip this entirely —
+      // the server has the yt-dlp URL cached and will serve it instantly.
       if (!reuseUrl || !isSameVideo) {
         currentYTUrlRef.current = u;
-        directAudioUrlRef.current = null;
 
-        // Try WebView first (phone IP → no bot detection)
+        // Try WebView first to get title/duration quickly
         let webViewResult: { audioUrl: string; title: string; duration: number } | null = null;
         try {
           webViewResult = await fetchAudioUrlViaWebView(u);
         } catch (webViewErr) {
-          console.warn("[loadAndPlay] WebView extraction failed:", (webViewErr as any)?.message, "→ falling back to server yt-dlp");
+          console.warn("[loadAndPlay] WebView extraction failed:", (webViewErr as any)?.message);
         }
 
         if (webViewResult) {
-          directAudioUrl = webViewResult.audioUrl;
-          directAudioUrlRef.current = directAudioUrl;
           setInfo({ title: webViewResult.title || "" });
           if (webViewResult.duration > 0) setDuration(webViewResult.duration);
-          // Key detection using direct URL
-          fetch(`${API_BASE}/audio/key?${new URLSearchParams({ directUrl: directAudioUrl })}`)
-            .then(r => r.ok ? r.json() : null)
-            .then(data => { if (data?.key) setDetectedKey({ key: data.key, mode: data.mode }); })
-            .catch(() => {});
         } else {
-          // Fallback: let the server use yt-dlp (tv_embedded / web_embedded clients)
-          directAudioUrl = null;
-          directAudioUrlRef.current = null;
-          // Set placeholder so the Now Playing / save button section appears
           setInfo({ title: "" });
-          // Try to get real title from server (best effort)
           fetch(`${API_BASE}/audio/info?${new URLSearchParams({ url: u })}`)
             .then(r => r.ok ? r.json() : null)
             .then(data => {
@@ -284,16 +267,16 @@ export default function TransposeScreen() {
               if (data?.duration > 0) setDuration(data.duration);
             })
             .catch(() => {});
-          // Key detection via server yt-dlp
-          fetch(`${API_BASE}/audio/key?${new URLSearchParams({ url: u })}`)
-            .then(r => r.ok ? r.json() : null)
-            .then(data => { if (data?.key) setDetectedKey({ key: data.key, mode: data.mode }); })
-            .catch(() => {});
         }
+        // Always detect key via server yt-dlp (server-side URL is not IP-restricted)
+        fetch(`${API_BASE}/audio/key?${new URLSearchParams({ url: u })}`)
+          .then(r => r.ok ? r.json() : null)
+          .then(data => { if (data?.key) setDetectedKey({ key: data.key, mode: data.mode }); })
+          .catch(() => {});
       }
 
       const { sound } = await Audio.Sound.createAsync(
-        { uri: buildStreamUrl(directAudioUrl, semi, startPosition) },
+        { uri: buildStreamUrl(semi, startPosition) },
         { shouldPlay: true, progressUpdateIntervalMillis: 1000 },
         (s: AVPlaybackStatus) => {
           if (!s.isLoaded) return;
