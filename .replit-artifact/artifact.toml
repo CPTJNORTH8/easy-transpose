@@ -1,0 +1,27 @@
+kind = "mobile"
+previewPath = "/"
+title = "Transpose - Music Transposer"
+version = "1.0.0"
+id = "artifacts/transpose-app"
+router = "expo-domain"
+
+[[integratedSkills]]
+name = "expo"
+version = "1.0.0"
+
+[[services]]
+ensurePreviewReachable = "/status"
+localPort = 20884
+name = "expo"
+paths = ["/"]
+
+[services.development]
+run = "pnpm --filter @workspace/transpose-app run dev"
+
+[services.env]
+PORT = "20884"
+BASE_PATH = "/"
+
+[services.production]
+build = ["pnpm", "--filter", "@workspace/transpose-app", "run", "build"]
+run = ["pnpm", "--filter", "@workspace/transpose-app", "run", "serve"]
