@@ -31,7 +31,11 @@ const PANEL_COLLAPSED = SCREEN_HEIGHT - 220;
 const PANEL_EXPANDED = SCREEN_HEIGHT * 0.44;
 const STORAGE_KEY = "@transpose_songs_v1";
 
-const API_BASE = `https://${process.env.EXPO_PUBLIC_DOMAIN}/api`;
+// EXPO_PUBLIC_API_URL is set at EAS build time for production APKs.
+// EXPO_PUBLIC_DOMAIN is the Replit dev-server domain used during development.
+const API_BASE =
+  process.env.EXPO_PUBLIC_API_URL ??
+  `https://${process.env.EXPO_PUBLIC_DOMAIN}/api`;
 
 type InfoState = { title: string } | null;
 type KeyState = { key: string; mode: string } | null;
