@@ -214,8 +214,9 @@ export default function TransposeScreen() {
         reject(new Error("Could not find a YouTube video ID in that link"));
         return;
       }
-      // Use the embed URL — it never requires sign-in or consent pages
-      const embedUrl = `https://www.youtube.com/embed/${videoId}?autoplay=1&enablejsapi=1&origin=https://www.youtube.com`;
+      // Load a youtube.com page so the WebView is in the youtube.com origin.
+      // Then injectedJavaScript calls the InnerTube API same-origin (no CORS block).
+      const embedUrl = `https://www.youtube.com/embed/${videoId}?autoplay=0&enablejsapi=1`;
       webViewRequestId.current += 1;
       const id = webViewRequestId.current;
       // Set up resolve/reject wrappers that clear the timeout — set BEFORE state update
@@ -726,22 +727,31 @@ export default function TransposeScreen() {
               allowsInlineMediaPlayback
               injectedJavaScriptBeforeContentLoaded={`
 (function() {
-  var done = false;
   window.__rnAudioDone = false;
+})();
+true;
+`}
+              injectedJavaScript={`
+(function() {
+  if (window.__rnAudioDone) return;
   function rnPost(d) {
     if (!window.ReactNativeWebView) return;
     if (window.__rnAudioDone && d.type !== 'error') return;
-    if (d.type === 'audioReady') window.__rnAudioDone = done = true;
+    if (d.type === 'audioReady') window.__rnAudioDone = true;
     window.ReactNativeWebView.postMessage(JSON.stringify(d));
   }
-  window.__rnAudioPost = rnPost;
 
-  function extractAudio(data) {
-    if (done) return false;
+  // Extract video ID from the embed URL path: /embed/VIDEO_ID
+  var videoId = location.pathname.replace('/embed/', '').split('?')[0].trim();
+  if (!videoId) { rnPost({type:'error', reason:'No video ID in embed URL'}); return; }
+
+  // --- Strategy 1: ytInitialPlayerResponse already on the page ---
+  function tryFromPlayerResponse(data) {
+    if (!data) return false;
     var fmts = (data.streamingData && data.streamingData.adaptiveFormats) || [];
-    var audio = fmts.filter(function(f){ return f.mimeType && f.mimeType.startsWith('audio'); });
+    var audio = fmts.filter(function(f){ return f.mimeType && f.mimeType.startsWith('audio') && f.url; });
     audio.sort(function(a,b){ return (b.bitrate||0)-(a.bitrate||0); });
-    if (audio.length > 0 && audio[0].url) {
+    if (audio.length > 0) {
       var title = (data.videoDetails && data.videoDetails.title) || '';
       var dur = parseInt((data.videoDetails && data.videoDetails.lengthSeconds)||'0')||0;
       rnPost({type:'audioReady', url:audio[0].url, title:title, duration:dur});
@@ -749,91 +759,48 @@ export default function TransposeScreen() {
     }
     return false;
   }
-  window.__rnExtractAudio = extractAudio;
 
-  // Intercept fetch
-  var _fetch = window.fetch;
-  window.fetch = function(input, opts) {
-    var url = (typeof input === 'string') ? input : (input && input.url ? input.url : '');
-    var p = _fetch.call(this, input, opts);
-    if (url && url.indexOf('youtubei/v1/player') !== -1) {
-      p.then(function(resp) { resp.clone().json().then(extractAudio).catch(function(){}); }).catch(function(){});
-    }
-    return p;
-  };
+  if (window.ytInitialPlayerResponse && tryFromPlayerResponse(window.ytInitialPlayerResponse)) return;
+  try { if (window.yt && window.yt.playerResponse && tryFromPlayerResponse(window.yt.playerResponse)) return; } catch(e){}
 
-  // Intercept XHR
-  var _open = XMLHttpRequest.prototype.open;
-  var _send = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.open = function(m, url) { this.__url = url; return _open.apply(this, arguments); };
-  XMLHttpRequest.prototype.send = function() {
-    if (this.__url && String(this.__url).indexOf('youtubei/v1/player') !== -1) {
-      var xhr = this; var _ol = xhr.onload;
-      xhr.onload = function() { try { extractAudio(JSON.parse(xhr.responseText)); } catch(e) {} if (_ol) _ol.apply(this, arguments); };
-    }
-    return _send.apply(this, arguments);
-  };
+  // --- Strategy 2: Call the InnerTube API directly (same-origin, phone's IP) ---
+  // The WebView is on youtube.com, so this is a same-origin call — no CORS block.
+  var clients = [
+    { name:'3', version:'19.44.38', ua:'com.google.android.youtube/19.44.38(Linux; U; Android 11) gzip',
+      body:{ clientName:'ANDROID', clientVersion:'19.44.38', androidSdkVersion:30, hl:'en', gl:'US' } },
+    { name:'5', version:'19.29.1',  ua:'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iPhone OS 17_5_1 like Mac OS X)',
+      body:{ clientName:'IOS', clientVersion:'19.29.1', deviceMake:'Apple', deviceModel:'iPhone16,2', osName:'iPhone', osVersion:'17.5.1.21F90', hl:'en', gl:'US' } },
+    { name:'1', version:'2.20240726.00.00', ua:'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      body:{ clientName:'WEB', clientVersion:'2.20240726.00.00', hl:'en', gl:'US' } },
+  ];
 
-  // Fast poll — ytInitialPlayerResponse is injected by an early inline <script>
-  // so it often appears within 300-800ms, well before the page "load" event fires.
-  var pollCount = 0;
-  var poll = setInterval(function() {
-    pollCount++;
-    if (done) { clearInterval(poll); return; }
-    if (window.ytInitialPlayerResponse) {
-      clearInterval(poll);
-      extractAudio(window.ytInitialPlayerResponse);
-      return;
-    }
-    // Also try yt.playerResponse
-    try { if (window.yt && window.yt.playerResponse) { clearInterval(poll); extractAudio(window.yt.playerResponse); return; } } catch(e) {}
-    if (pollCount > 120) clearInterval(poll); // stop after 12s
-  }, 100);
-})();
-true;
-`}
-              injectedJavaScript={`
-(function() {
-  var post = window.__rnAudioPost;
-  var extract = window.__rnExtractAudio;
-  if (!post || !extract) return;
-
-  // 1. Try ytInitialPlayerResponse — baked into page HTML by YouTube
-  if (window.ytInitialPlayerResponse && extract(window.ytInitialPlayerResponse)) return;
-
-  // 2. Try yt.playerResponse (alternate location)
-  try {
-    var yt = window.yt;
-    if (yt && yt.playerResponse && extract(yt.playerResponse)) return;
-  } catch(e) {}
-
-  // 3. Scan all script tags for ytInitialPlayerResponse JSON
-  var scripts = document.querySelectorAll('script');
-  for (var i = 0; i < scripts.length; i++) {
-    var t = scripts[i].textContent || '';
-    var idx = t.indexOf('ytInitialPlayerResponse');
-    if (idx !== -1) {
-      try {
-        var json = t.substring(idx + 'ytInitialPlayerResponse'.length).replace(/^\\s*=\\s*/, '');
-        // find balanced JSON object
-        var depth = 0; var start = json.indexOf('{');
-        if (start === -1) continue;
-        for (var j = start; j < json.length; j++) {
-          if (json[j] === '{') depth++;
-          else if (json[j] === '}') { depth--; if (depth === 0) { var obj = JSON.parse(json.substring(start, j+1)); if (extract(obj)) return; break; } }
-        }
-      } catch(e) {}
-    }
+  function tryNextClient(idx) {
+    if (idx >= clients.length) { rnPost({type:'error', reason:'All InnerTube clients failed'}); return; }
+    var c = clients[idx];
+    fetch('/youtubei/v1/player?prettyPrint=false', {
+      method:'POST',
+      headers:{
+        'Content-Type':'application/json',
+        'User-Agent': c.ua,
+        'X-YouTube-Client-Name': c.name,
+        'X-YouTube-Client-Version': c.version,
+      },
+      body: JSON.stringify({ videoId: videoId, context:{ client: c.body } })
+    })
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+      if (tryFromPlayerResponse(data)) return;
+      var status = data && data.playabilityStatus && data.playabilityStatus.status;
+      if (status === 'LOGIN_REQUIRED' || status === 'ERROR') {
+        tryNextClient(idx+1);
+      } else {
+        tryNextClient(idx+1);
+      }
+    })
+    .catch(function(){ tryNextClient(idx+1); });
   }
 
-  // 4. Autoplay trigger — force the embed player to initialize
-  // (fall through: the fetch/XHR intercepts will catch it when the player loads)
-  // Set a timeout so user gets meaningful error if nothing worked
-  setTimeout(function() {
-    if (!window.__rnAudioDone) {
-      post({type:'error', reason:'Could not find audio stream in YouTube embed page'});
-    }
-  }, 10000);
+  tryNextClient(0);
 })();
 true;
 `}
