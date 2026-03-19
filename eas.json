@@ -9,7 +9,7 @@
         "buildType": "apk"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://workspace--cptjnorth.replit.app/api"
+        "EXPO_PUBLIC_API_URL": "https://music-transposer.replit.app/api"
       }
     }
   }
