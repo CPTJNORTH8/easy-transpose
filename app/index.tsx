@@ -136,11 +136,12 @@ export default function TransposeScreen() {
   const isSaved = savedSongs.some(s => s.url === url);
 
   const directAudioUrlRef = useRef<string | null>(null);
+  const directAudioUARef = useRef<string | null>(null);
   const currentYTUrlRef = useRef<string | null>(null);
   const pendingReloadRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const speedRef = useRef(1.0);
   const [webViewRequest, setWebViewRequest] = useState<{ url: string; id: number } | null>(null);
-  const webViewResolveRef = useRef<((r: { audioUrl: string; title: string; duration: number }) => void) | null>(null);
+  const webViewResolveRef = useRef<((r: { audioUrl: string; title: string; duration: number; userAgent?: string }) => void) | null>(null);
   const webViewRejectRef = useRef<((e: Error) => void) | null>(null);
   const webViewRequestId = useRef(0);
 
@@ -200,9 +201,11 @@ export default function TransposeScreen() {
 
   const buildStreamUrl = useCallback((semi: number, seek = 0) => {
     const directUrl = directAudioUrlRef.current;
+    const ua = directAudioUARef.current;
     const params = new URLSearchParams({ semitones: semi.toString() });
     if (directUrl) params.set("directUrl", directUrl);
     else params.set("url", currentYTUrlRef.current || "");
+    if (ua) params.set("userAgent", ua);
     if (seek > 0.5) params.set("seek", seek.toFixed(2));
     return `${API_BASE}/audio/stream?${params}`;
   }, []);
@@ -262,10 +265,13 @@ export default function TransposeScreen() {
 
         if (webViewResult) {
           directAudioUrlRef.current = webViewResult.audioUrl;
+          directAudioUARef.current = webViewResult.userAgent || null;
           setInfo({ title: webViewResult.title || "" });
           if (webViewResult.duration > 0) setDuration(webViewResult.duration);
           // Key detection using the CDN URL directly — no yt-dlp needed on server
-          fetch(`${API_BASE}/audio/key?${new URLSearchParams({ directUrl: webViewResult.audioUrl })}`)
+          const keyParams: Record<string, string> = { directUrl: webViewResult.audioUrl };
+          if (webViewResult.userAgent) keyParams.userAgent = webViewResult.userAgent;
+          fetch(`${API_BASE}/audio/key?${new URLSearchParams(keyParams)}`)
             .then(r => r.ok ? r.json() : null)
             .then(data => { if (data?.key) setDetectedKey({ key: data.key, mode: data.mode }); })
             .catch(() => {});
@@ -289,12 +295,18 @@ export default function TransposeScreen() {
       // stream directly from YouTube CDN on the phone's own IP — no server at all.
       // For pitch-shifted audio: always go through the server (ffmpeg processes the CDN URL).
       const directUrl = directAudioUrlRef.current;
-      const playUri = (directUrl && Math.abs(semi) < 0.01 && !startPosition)
-        ? directUrl
-        : buildStreamUrl(semi, startPosition);
+      const directUA = directAudioUARef.current;
+      const usingDirect = !!(directUrl && Math.abs(semi) < 0.01 && !startPosition);
+      const playUri = usingDirect ? directUrl! : buildStreamUrl(semi, startPosition);
+      // YouTube CDN URLs from InnerTube require the client User-Agent that was used to fetch them.
+      // Without it, the CDN returns 404. Pass it as a request header to ExoPlayer.
+      const sourceObj: { uri: string; headers?: Record<string, string> } = { uri: playUri };
+      if (usingDirect && directUA) {
+        sourceObj.headers = { "User-Agent": directUA };
+      }
 
       const { sound } = await Audio.Sound.createAsync(
-        { uri: playUri },
+        sourceObj,
         { shouldPlay: true, progressUpdateIntervalMillis: 1000 },
         (s: AVPlaybackStatus) => {
           if (!s.isLoaded) return;
@@ -789,13 +801,18 @@ true;
     })
     .then(function(r){ return r.json(); })
     .then(function(data){
-      if (tryFromPlayerResponse(data)) return;
-      var status = data && data.playabilityStatus && data.playabilityStatus.status;
-      if (status === 'LOGIN_REQUIRED' || status === 'ERROR') {
-        tryNextClient(idx+1);
-      } else {
-        tryNextClient(idx+1);
+      // Pass the winning UA so ExoPlayer can use it as a request header
+      if (!data) { tryNextClient(idx+1); return; }
+      var fmts = (data.streamingData && data.streamingData.adaptiveFormats) || [];
+      var audio = fmts.filter(function(f){ return f.mimeType && f.mimeType.startsWith('audio') && f.url; });
+      audio.sort(function(a,b){ return (b.bitrate||0)-(a.bitrate||0); });
+      if (audio.length > 0) {
+        var title = (data.videoDetails && data.videoDetails.title) || '';
+        var dur = parseInt((data.videoDetails && data.videoDetails.lengthSeconds)||'0')||0;
+        rnPost({type:'audioReady', url:audio[0].url, title:title, duration:dur, userAgent:c.ua});
+        return;
       }
+      tryNextClient(idx+1);
     })
     .catch(function(){ tryNextClient(idx+1); });
   }
@@ -812,7 +829,7 @@ true;
                     const resolve = webViewResolveRef.current;
                     webViewResolveRef.current = null;
                     webViewRejectRef.current = null;
-                    resolve?.({ audioUrl: data.url, title: data.title || "", duration: data.duration || 0 });
+                    resolve?.({ audioUrl: data.url, title: data.title || "", duration: data.duration || 0, userAgent: data.userAgent || "" });
                   } else {
                     const reject = webViewRejectRef.current;
                     webViewResolveRef.current = null;
